@@ -24,16 +24,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration from environment variables or defaults
-BRIGHTDATA_URL = os.getenv(
-    'BRIGHTDATA_URL',
-    "https://api.brightdata.com/datasets/v3/trigger?dataset_id=gd_mfz5x93lmsjjjylob&notify=false&include_errors=true"
-)
+# Configuration from environment variables
+BRIGHTDATA_URL = os.getenv('BRIGHTDATA_URL', "")
 BRIGHTDATA_API_KEY = os.getenv('BRIGHTDATA_API_KEY', "")
 
 # Supabase Configuration
-SUPABASE_URL = os.getenv('SUPABASE_URL', "https://fjrysnhleratybutzvkt.supabase.co" \
-"")
+SUPABASE_URL = os.getenv('SUPABASE_URL', "")
 SUPABASE_KEY = os.getenv('SUPABASE_KEY', "")
 
 
@@ -59,7 +55,9 @@ class BrightdataClient:
             JSON response data or None if failed
         """
         try:
-            url = f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json"
+            # Extract base URL from trigger URL and construct snapshot URL
+            base_url = self.url.split('/trigger')[0] if '/trigger' in self.url else 'https://api.brightdata.com/datasets/v3'
+            url = f"{base_url}/snapshot/{snapshot_id}?format=json"
             
             response = requests.get(
                 url,
