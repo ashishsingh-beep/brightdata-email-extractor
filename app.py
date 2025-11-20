@@ -379,6 +379,7 @@ def process_unprocessed_snapshots():
         skipped = 0
         db_errors = 0
         duplicate_snapshots = 0
+        running_snapshots = 0
         
         # Process each snapshot with progress
         progress_bar = st.progress(0)
@@ -392,9 +393,13 @@ def process_unprocessed_snapshots():
             status_text.text(f"Processing {idx + 1}/{total}: {snapshot_id}")
             
             # Retrieve snapshot data
-            data = brightdata_client.get_snapshot_data(snapshot_id)
+            data, is_running = brightdata_client.get_snapshot_data(snapshot_id)
             
-            if data:
+            if is_running:
+                # Skip snapshots that are still running
+                running_snapshots += 1
+                logger.warning(f"Snapshot {snapshot_id} is still running - skipping")
+            elif data:
                 # Save response to Supabase response_table
                 save_success, error_type = supabase_client.save_response(snapshot_id, data)
                 if save_success:
@@ -437,6 +442,7 @@ def process_unprocessed_snapshots():
             'skipped': skipped,
             'db_errors': db_errors,
             'duplicate_snapshots': duplicate_snapshots,
+            'running_snapshots': running_snapshots,
             'message': f'Processed {successful}/{total} snapshots successfully'
         }
         
@@ -450,6 +456,7 @@ def process_unprocessed_snapshots():
             'skipped': 0,
             'db_errors': 0,
             'duplicate_snapshots': 0,
+            'running_snapshots': 0,
             'message': f'Error: {str(e)}'
         }
 
@@ -506,6 +513,10 @@ def display_stage2_tab():
             if result.get('duplicate_snapshots', 0) > 0:
                 st.info(f"ℹ️ {result['duplicate_snapshots']} duplicate snapshots skipped (already exist in database)")
             
+            # Show running snapshots info if any
+            if result.get('running_snapshots', 0) > 0:
+                st.warning(f"⚠️ {result['running_snapshots']} snapshots still running (will be processed later)")
+            
             # Show database errors if any
             if result.get('db_errors', 0) > 0:
                 st.error(f"⚠️ {result['db_errors']} database errors occurred")
@@ -557,10 +568,13 @@ def extract_emails_from_json(json_data):
     return extract_emails_from_text(json_string)
 
 
-def process_responses_for_emails():
+def process_all_responses_for_emails(total_count: int):
     """
-    Process all unextracted responses from Supabase and extract emails
+    Process all unextracted responses sequentially in batches
     
+    Args:
+        total_count: Total number of eligible rows to process
+        
     Returns:
         Dictionary with extraction statistics
     """
@@ -570,8 +584,143 @@ def process_responses_for_emails():
         supabase_key = os.getenv('SUPABASE_KEY') or ""
         supabase_client = SupabaseClient(supabase_url, supabase_key)
         
-        # Get unextracted responses
-        rows = supabase_client.get_unextracted_responses()
+        BATCH_SIZE = 20
+        num_batches = (total_count + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        # Initialize overall counters
+        total_processed = 0
+        total_successful = 0
+        total_failed = 0
+        total_emails_extracted = 0
+        total_db_errors = 0
+        total_duplicate_emails = 0
+        
+        # Create progress containers
+        overall_progress_bar = st.progress(0)
+        batch_status = st.empty()
+        current_batch_progress = st.empty()
+        email_log = st.empty()
+        
+        # Process in batches
+        for batch_num in range(num_batches):
+            batch_status.info(f"📦 Processing Batch {batch_num + 1}/{num_batches}")
+            
+            # Fetch current batch (always from offset 0 since we mark as extracted)
+            rows = supabase_client.get_unextracted_responses(limit=BATCH_SIZE, offset=0)
+            
+            if not rows:
+                batch_status.warning(f"Batch {batch_num + 1}: No more rows to process")
+                break
+            
+            # Process each row in current batch
+            batch_total = len(rows)
+            batch_emails = 0
+            batch_duplicates = 0
+            batch_errors = 0
+            
+            for idx, row in enumerate(rows):
+                snapshot_id = row.get('snapshot_id')
+                response_data = row.get('response')
+                
+                if not snapshot_id or not response_data:
+                    total_failed += 1
+                    batch_errors += 1
+                    continue
+                
+                # Extract emails from response
+                emails = extract_emails_from_json(response_data)
+                
+                if emails:
+                    # Save each email
+                    for email in emails:
+                        success, error_type = supabase_client.save_email(email)
+                        if success:
+                            batch_emails += 1
+                            email_log.success(f"✅ Batch {batch_num + 1} [{idx + 1}/{batch_total}]: Saved {email}")
+                        elif error_type == 'duplicate':
+                            batch_duplicates += 1
+                            email_log.info(f"ℹ️ Batch {batch_num + 1} [{idx + 1}/{batch_total}]: Duplicate {email}")
+                        else:
+                            batch_errors += 1
+                            email_log.error(f"❌ Batch {batch_num + 1} [{idx + 1}/{batch_total}]: Failed {email}")
+                
+                # Mark as extracted
+                if supabase_client.mark_email_extracted(snapshot_id):
+                    total_successful += 1
+                else:
+                    total_failed += 1
+                    batch_errors += 1
+                
+                total_processed += 1
+            
+            # Update overall progress
+            overall_progress = min(total_processed / total_count, 1.0)
+            overall_progress_bar.progress(overall_progress)
+            current_batch_progress.text(f"Batch {batch_num + 1} Complete: {batch_emails} emails saved, {batch_duplicates} duplicates, {batch_errors} errors")
+            
+            # Update totals
+            total_emails_extracted += batch_emails
+            total_duplicate_emails += batch_duplicates
+            total_db_errors += batch_errors
+        
+        # Clear progress displays
+        overall_progress_bar.progress(1.0)
+        batch_status.success(f"✅ All {num_batches} batches processed!")
+        
+        return {
+            'total': total_processed,
+            'successful': total_successful,
+            'failed': total_failed,
+            'total_emails': total_emails_extracted,
+            'duplicate_emails': total_duplicate_emails,
+            'db_errors': total_db_errors,
+            'message': f'Processed {total_successful}/{total_processed} responses successfully'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in process_all_responses_for_emails: {e}")
+        st.error(f"Critical error: {str(e)}")
+        return {
+            'total': 0,
+            'successful': 0,
+            'failed': 0,
+            'total_emails': 0,
+            'duplicate_emails': 0,
+            'db_errors': 0,
+            'message': f'Error: {str(e)}'
+        }
+
+
+def process_responses_for_emails(batch_size: int = 20):
+    """
+    Process unextracted responses from Supabase and extract emails
+    DEPRECATED: Use process_all_responses_for_emails instead
+    
+    Args:
+        batch_size: Total number of rows to process (fetched in sub-batches of 20)
+        
+    Returns:
+        Dictionary with extraction statistics
+    """
+    try:
+        # Initialize Supabase client
+        supabase_url = os.getenv('SUPABASE_URL') or ""
+        supabase_key = os.getenv('SUPABASE_KEY') or ""
+        supabase_client = SupabaseClient(supabase_url, supabase_key)
+        
+        # Fetch in sub-batches of 20 to avoid timeout
+        SUB_BATCH_SIZE = 20
+        all_rows = []
+        
+        for offset in range(0, batch_size, SUB_BATCH_SIZE):
+            current_limit = min(SUB_BATCH_SIZE, batch_size - offset)
+            rows_batch = supabase_client.get_unextracted_responses(limit=current_limit, offset=offset)
+            all_rows.extend(rows_batch)
+            if len(rows_batch) < current_limit:
+                # No more rows available
+                break
+        
+        rows = all_rows
         
         if not rows:
             return {
@@ -670,18 +819,28 @@ def display_stage3_tab():
     supabase_client = SupabaseClient(supabase_url, supabase_key)
     
     # Get unextracted count
-    rows = supabase_client.get_unextracted_responses()
-    eligible_count = len(rows)
+    eligible_count = supabase_client.count_unextracted_responses()
     
-    st.metric("Eligible Rows", eligible_count)
+    # Calculate number of batches
+    BATCH_SIZE = 20
+    num_batches = (eligible_count + BATCH_SIZE - 1) // BATCH_SIZE if eligible_count > 0 else 0
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.metric("Total Eligible Rows", eligible_count)
+    
+    with col2:
+        st.metric("Batches (20 rows each)", num_batches)
     
     st.divider()
     
     process_button = st.button(
-        "Process",
+        "Process All",
         use_container_width=True,
         type="primary",
-        key="stage3_process"
+        key="stage3_process",
+        help=f"Process all {eligible_count} rows in {num_batches} sequential batches"
     )
     
     # Process when button clicked
@@ -689,8 +848,7 @@ def display_stage3_tab():
         if eligible_count == 0:
             st.info("No unextracted responses found")
         else:
-            with st.spinner("Processing..."):
-                result = process_responses_for_emails()
+            result = process_all_responses_for_emails(eligible_count)
             
             st.divider()
             

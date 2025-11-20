@@ -11,6 +11,7 @@ import os
 import csv
 from typing import List, Dict, Optional
 from supabase import create_client, Client
+from postgrest.types import CountMethod
 from dotenv import load_dotenv
 import logging
 
@@ -44,7 +45,7 @@ class BrightdataClient:
             'Content-Type': 'application/json'
         }
     
-    def get_snapshot_data(self, snapshot_id: str) -> Optional[Dict]:
+    def get_snapshot_data(self, snapshot_id: str) -> tuple[Optional[Dict], bool]:
         """
         Retrieve data for a specific snapshot ID
         
@@ -52,8 +53,10 @@ class BrightdataClient:
             snapshot_id: The snapshot ID to retrieve
             
         Returns:
-            JSON response data or None if failed
+            Tuple of (JSON response data or None if failed, is_still_running boolean)
         """
+        import json
+        
         try:
             # Extract base URL from trigger URL and construct snapshot URL
             base_url = self.url.split('/trigger')[0] if '/trigger' in self.url else 'https://api.brightdata.com/datasets/v3'
@@ -67,15 +70,25 @@ class BrightdataClient:
             response.raise_for_status()
             
             data = response.json()
-            logger.info(f"Successfully retrieved data for snapshot: {snapshot_id}")
-            return data
+            
+            # Check if data is still running
+            # Convert first part of data to string and check for 'running' keyword
+            data_str = json.dumps(data)[:500].lower()  # Check first 500 chars
+            is_running = 'running' in data_str
+            
+            if is_running:
+                logger.warning(f"Snapshot {snapshot_id} is still running")
+            else:
+                logger.info(f"Successfully retrieved data for snapshot: {snapshot_id}")
+            
+            return data, is_running
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Error retrieving snapshot {snapshot_id}: {e}")
-            return None
+            return None, False
         except json.JSONDecodeError as e:
             logger.error(f"Error decoding response for snapshot {snapshot_id}: {e}")
-            return None
+            return None, False
     
     def create_payload(self, keywords: List[str]) -> str:
         """
@@ -261,23 +274,46 @@ class SupabaseClient:
                 logger.error(f"Error saving response to Supabase: {e}")
                 return False, 'error'
     
-    def get_unextracted_responses(self) -> List[Dict]:
+    def get_unextracted_responses(self, limit: int = 20, offset: int = 0) -> List[Dict]:
         """
-        Get all responses where is_email_extracted = false
+        Get responses from response_table where emails haven't been extracted yet
         
+        Args:
+            limit: Maximum number of rows to fetch (default 20)
+            offset: Number of rows to skip (default 0)
+            
         Returns:
             List of dictionaries with snapshot_id and response data
         """
         try:
-            response = self.client.table('response_table').select('snapshot_id, response').eq('is_email_extracted', False).execute()
+            response = self.client.table('response_table').select('snapshot_id, response').eq('is_email_extracted', False).range(offset, offset + limit - 1).execute()
             
             rows = response.data if response.data else []
-            logger.info(f"Found {len(rows)} unextracted responses")
+            logger.info(f"Found {len(rows)} unextracted responses (limit: {limit}, offset: {offset})")
             return rows
             
         except Exception as e:
             logger.error(f"Error fetching unextracted responses: {e}")
             return []
+    
+    def count_unextracted_responses(self) -> int:
+        """
+        Get count of unextracted responses without fetching data
+        
+        Returns:
+            Count of rows where is_email_extracted = false
+        """
+        try:
+            # Use CountMethod.exact to get count efficiently without fetching data
+            response = self.client.table('response_table').select('*', count=CountMethod.exact).eq('is_email_extracted', False).limit(0).execute()
+            
+            count = response.count if hasattr(response, 'count') and response.count is not None else 0
+            logger.info(f"Total unextracted responses: {count}")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error counting unextracted responses: {e}")
+            return 0
     
     def mark_email_extracted(self, snapshot_id: str) -> bool:
         """
