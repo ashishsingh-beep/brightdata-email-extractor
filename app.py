@@ -6,14 +6,28 @@ import streamlit as st
 import csv
 import os
 import re
+import sys
 from io import StringIO
 from dotenv import load_dotenv
-from email_scraper import (
-    BrightdataClient,
-    SupabaseClient,
-    EmailScraperEngine,
-    logger
-)
+
+# Force reload of email_scraper module to ensure latest code is loaded
+if 'email_scraper' in sys.modules:
+    import importlib
+    import email_scraper
+    importlib.reload(email_scraper)
+    from email_scraper import (
+        BrightdataClient,
+        SupabaseClient,
+        EmailScraperEngine,
+        logger
+    )
+else:
+    from email_scraper import (
+        BrightdataClient,
+        SupabaseClient,
+        EmailScraperEngine,
+        logger
+    )
 
 # Load environment variables
 load_dotenv()
@@ -115,6 +129,183 @@ def load_csv_queries(uploaded_file) -> list:
     except Exception as e:
         st.error(f"Error reading CSV file: {str(e)}")
         return []
+
+
+def filter_queries(uploaded_queries: list, existing_queries: list) -> dict:
+    """
+    Filter queries by comparing against existing database queries
+    
+    Args:
+        uploaded_queries: List of queries from CSV
+        existing_queries: List of existing queries from database (lowercase)
+        
+    Returns:
+        Dictionary with filtered results
+    """
+    # Remove duplicates from uploaded queries (case-insensitive)
+    unique_queries = []
+    seen = set()
+    for query in uploaded_queries:
+        query_lower = query.lower().strip()
+        if query_lower and query_lower not in seen:
+            unique_queries.append(query)
+            seen.add(query_lower)
+    
+    # Split into new vs existing
+    new_queries = []
+    existing_in_db = []
+    
+    for query in unique_queries:
+        query_lower = query.lower().strip()
+        if query_lower in existing_queries:
+            existing_in_db.append(query)
+        else:
+            new_queries.append(query)
+    
+    return {
+        'total_uploaded': len(uploaded_queries),
+        'duplicates_in_csv': len(uploaded_queries) - len(unique_queries),
+        'unique_in_csv': len(unique_queries),
+        'new_queries': new_queries,
+        'existing_in_db': existing_in_db,
+        'new_count': len(new_queries),
+        'existing_count': len(existing_in_db)
+    }
+
+
+def display_stage0_tab():
+    """Display Stage 0 tab for filtering queries"""
+    st.header("🔍 Stage 0: Filter Queries")
+    st.markdown("Remove duplicate and already processed queries from your CSV file.")
+    
+    st.divider()
+    
+    # Upload section
+    st.subheader("📄 Upload CSV File")
+    uploaded_file = st.file_uploader(
+        "Choose a CSV file to filter",
+        type="csv",
+        key="stage0_upload"
+    )
+    
+    if uploaded_file is not None:
+        # Load queries from CSV
+        uploaded_queries = load_csv_queries(uploaded_file)
+        
+        if not uploaded_queries:
+            st.error("❌ No queries found in CSV file. Please check your file format.")
+            return
+        
+        st.divider()
+        
+        # Initialize Supabase client
+        supabase_url = os.getenv('SUPABASE_URL') or ""
+        supabase_key = os.getenv('SUPABASE_KEY') or ""
+        
+        if not supabase_url or not supabase_key:
+            st.error("❌ Database configuration missing. Please check .env file.")
+            return
+        
+        try:
+            supabase_client = SupabaseClient(supabase_url, supabase_key)
+            
+            with st.spinner("🔍 Checking queries against database..."):
+                # Get existing queries from database
+                existing_queries = supabase_client.get_all_existing_queries()
+                
+                # Filter queries
+                result = filter_queries(uploaded_queries, existing_queries)
+            
+            st.divider()
+            
+            # Display metrics
+            st.subheader("📊 Filter Results")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric(
+                    "Total Uploaded",
+                    result['total_uploaded']
+                )
+            
+            with col2:
+                st.metric(
+                    "Duplicates in CSV",
+                    result['duplicates_in_csv'],
+                    delta="removed"
+                )
+            
+            with col3:
+                st.metric(
+                    "✅ New Queries",
+                    result['new_count'],
+                    delta="to process"
+                )
+            
+            with col4:
+                st.metric(
+                    "⚠️ Already Exists",
+                    result['existing_count'],
+                    delta="skipped"
+                )
+            
+            st.divider()
+            
+            # Display query lists
+            col_left, col_right = st.columns(2)
+            
+            with col_left:
+                st.subheader("✅ New Queries")
+                if result['new_queries']:
+                    with st.expander(f"View {len(result['new_queries'])} new queries", expanded=True):
+                        for idx, query in enumerate(result['new_queries'], 1):
+                            st.markdown(f"{idx}. {query}")
+                else:
+                    st.info("🚫 No new queries found.")
+            
+            with col_right:
+                st.subheader("⚠️ Already in Database")
+                if result['existing_in_db']:
+                    with st.expander(f"View {len(result['existing_in_db'])} existing queries", expanded=False):
+                        for idx, query in enumerate(result['existing_in_db'], 1):
+                            st.markdown(f"{idx}. {query}")
+                else:
+                    st.success("✅ No duplicates found!")
+            
+            st.divider()
+            
+            # Download section
+            st.subheader("📥 Download Filtered CSV")
+            
+            if result['new_queries']:
+                # Create CSV for download
+                csv_output = StringIO()
+                csv_writer = csv.writer(csv_output)
+                csv_writer.writerow(['Query'])
+                for query in result['new_queries']:
+                    csv_writer.writerow([query])
+                
+                csv_data = csv_output.getvalue()
+                
+                st.download_button(
+                    label=f"📥 Download Filtered CSV ({len(result['new_queries'])} queries)",
+                    data=csv_data,
+                    file_name=f"filtered_queries_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    type="primary"
+                )
+                
+                st.success("✅ Ready to download! Use this filtered CSV in Stage 1 for processing.")
+            else:
+                st.warning("⚠️ All queries already exist in database. No new queries to process.")
+                st.info("💡 Tip: Upload a different CSV file with new queries.")
+        
+        except Exception as e:
+            st.error(f"❌ Error: {str(e)}")
+            st.error("Cannot connect to database. Please check your configuration.")
+            logger.error(f"Stage 0 error: {e}")
 
 
 def display_header():
@@ -327,6 +518,19 @@ def display_results(stats):
         st.warning(f"{stats['failed_batches']} batches failed")
     else:
         st.error("Processing failed")
+    
+    # Display snapshot-query mapping
+    if stats.get('snapshot_query_map'):
+        st.divider()
+        st.subheader("📋 Snapshot → Query Mapping")
+        
+        with st.expander("👁️ View Snapshot Details", expanded=True):
+            for snapshot_id, queries in stats['snapshot_query_map'].items():
+                st.markdown(f"**Snapshot ID:** `{snapshot_id}`")
+                st.markdown(f"**Queries ({len(queries)}):**")
+                for idx, query in enumerate(queries, 1):
+                    st.markdown(f"  {idx}. {query}")
+                st.divider()
 
 
 def process_unprocessed_snapshots():
@@ -349,6 +553,7 @@ def process_unprocessed_snapshots():
                 'skipped': 0,
                 'db_errors': 0,
                 'duplicate_snapshots': 0,
+                'invalid_responses': 0,
                 'message': 'API key not provided'
             }
         
@@ -360,46 +565,81 @@ def process_unprocessed_snapshots():
         brightdata_client = BrightdataClient(api_key, brightdata_url)
         supabase_client = SupabaseClient(supabase_url, supabase_key)
         
-        # Get unprocessed snapshots
-        snapshot_ids = supabase_client.get_unprocessed_snapshots()
+        # Get unprocessed snapshots (now returns list of dicts with snapshot_id and query)
+        snapshots = supabase_client.get_unprocessed_snapshots()
         
-        if not snapshot_ids:
+        if not snapshots:
             return {
                 'total': 0,
                 'successful': 0,
                 'failed': 0,
                 'skipped': 0,
+                'invalid_responses': 0,
                 'message': 'No unprocessed snapshots found'
             }
         
         # Initialize counters
-        total = len(snapshot_ids)
+        total = len(snapshots)
         successful = 0
         failed = 0
         skipped = 0
         db_errors = 0
         duplicate_snapshots = 0
         running_snapshots = 0
+        invalid_responses = 0
         
         # Process each snapshot with progress
         progress_bar = st.progress(0)
         status_text = st.empty()
+        query_text = st.empty()
         error_text = st.empty()
         
-        for idx, snapshot_id in enumerate(snapshot_ids):
+        for idx, snapshot_data in enumerate(snapshots):
+            snapshot_id = snapshot_data.get('snapshot_id')
+            queries = snapshot_data.get('query', [])
+            
             # Update progress
             progress = (idx + 1) / total
             progress_bar.progress(progress)
             status_text.text(f"Processing {idx + 1}/{total}: {snapshot_id}")
             
-            # Retrieve snapshot data
-            data, is_running = brightdata_client.get_snapshot_data(snapshot_id)
+            # Display queries associated with this snapshot
+            if queries:
+                query_text.info(f"📝 Queries: {' | '.join(queries)}")
             
-            if is_running:
-                # Skip snapshots that are still running
-                running_snapshots += 1
-                logger.warning(f"Snapshot {snapshot_id} is still running - skipping")
-            elif data:
+            try:
+                # Retrieve snapshot data with validation
+                result = brightdata_client.get_snapshot_data(snapshot_id)
+                
+                # Handle tuple unpacking - new version returns 4 values
+                if len(result) == 4:
+                    data, is_running, is_valid, error_reason = result
+                else:
+                    # Fallback for old version (shouldn't happen after restart)
+                    data, is_running = result
+                    is_valid = not is_running and data is not None
+                    error_reason = "Legacy response format"
+                
+                # Check if response is invalid (status running or error with size < 2000)
+                if not is_valid:
+                    # Don't save to response_table, keep processed = false
+                    invalid_responses += 1
+                    if is_running:
+                        running_snapshots += 1
+                    logger.warning(f"Snapshot {snapshot_id} is invalid: {error_reason} - skipping (will remain unprocessed)")
+                    error_text.warning(f"⚠️ Invalid response for {snapshot_id}: {error_reason}")
+                    continue  # Skip to next snapshot
+                    
+            except Exception as e:
+                # Handle any errors during retrieval
+                failed += 1
+                error_msg = f"Error retrieving {snapshot_id}: {str(e)}"
+                logger.error(error_msg)
+                error_text.error(f"❌ {error_msg}")
+                continue  # Skip to next snapshot
+            
+            # Process valid data
+            if data:
                 # Save response to Supabase response_table
                 save_success, error_type = supabase_client.save_response(snapshot_id, data)
                 if save_success:
@@ -443,6 +683,7 @@ def process_unprocessed_snapshots():
             'db_errors': db_errors,
             'duplicate_snapshots': duplicate_snapshots,
             'running_snapshots': running_snapshots,
+            'invalid_responses': invalid_responses,
             'message': f'Processed {successful}/{total} snapshots successfully'
         }
         
@@ -457,6 +698,7 @@ def process_unprocessed_snapshots():
             'db_errors': 0,
             'duplicate_snapshots': 0,
             'running_snapshots': 0,
+            'invalid_responses': 0,
             'message': f'Error: {str(e)}'
         }
 
@@ -470,11 +712,30 @@ def display_stage2_tab():
     supabase_key = os.getenv('SUPABASE_KEY') or ""
     supabase_client = SupabaseClient(supabase_url, supabase_key)
     
-    # Get unprocessed count
-    snapshot_ids = supabase_client.get_unprocessed_snapshots()
-    eligible_count = len(snapshot_ids)
+    # Get unprocessed snapshots (returns list of dicts with snapshot_id and query)
+    snapshots = supabase_client.get_unprocessed_snapshots()
+    eligible_count = len(snapshots)
     
-    st.metric("Eligible Rows", eligible_count)
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.metric("Eligible Snapshots", eligible_count)
+    with col2:
+        total_queries = sum(len(s.get('query', [])) for s in snapshots)
+        st.metric("Total Queries", total_queries)
+    
+    # Preview snapshots with queries
+    if snapshots:
+        with st.expander("👁️ Preview Unprocessed Snapshots", expanded=False):
+            for snapshot in snapshots[:5]:  # Show first 5
+                st.markdown(f"**Snapshot:** `{snapshot.get('snapshot_id', 'N/A')}`")
+                queries = snapshot.get('query', [])
+                if queries:
+                    st.markdown(f"**Queries ({len(queries)}):** {' | '.join(queries)}")
+                else:
+                    st.markdown("**Queries:** None")
+                st.divider()
+            if len(snapshots) > 5:
+                st.info(f"... and {len(snapshots) - 5} more snapshots")
     
     st.divider()
     
@@ -513,9 +774,9 @@ def display_stage2_tab():
             if result.get('duplicate_snapshots', 0) > 0:
                 st.info(f"ℹ️ {result['duplicate_snapshots']} duplicate snapshots skipped (already exist in database)")
             
-            # Show running snapshots info if any
-            if result.get('running_snapshots', 0) > 0:
-                st.warning(f"⚠️ {result['running_snapshots']} snapshots still running (will be processed later)")
+            # Show invalid responses info if any
+            if result.get('invalid_responses', 0) > 0:
+                st.warning(f"⚠️ {result['invalid_responses']} invalid responses (status running or error with size < 2000 bytes) - will remain unprocessed for retry")
             
             # Show database errors if any
             if result.get('db_errors', 0) > 0:
@@ -989,8 +1250,17 @@ def main():
     
     st.divider()
     
-    # Create tabs for Stage 1, Stage 2, Stage 3, and Stage 4
-    tab1, tab2, tab3, tab4 = st.tabs(["📤 Stage 1: Upload & Process", "📥 Stage 2: Retrieve Data", "📧 Stage 3: Extract Emails", "📊 Stage 4: View Emails"])
+    # Create tabs for Stage 0, Stage 1, Stage 2, Stage 3, and Stage 4
+    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+        "🔍 Stage 0: Filter Queries",
+        "📤 Stage 1: Upload & Process", 
+        "📥 Stage 2: Retrieve Data", 
+        "📧 Stage 3: Extract Emails", 
+        "📊 Stage 4: View Emails"
+    ])
+    
+    with tab0:
+        display_stage0_tab()
     
     with tab1:
         # Upload section

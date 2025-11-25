@@ -45,7 +45,7 @@ class BrightdataClient:
             'Content-Type': 'application/json'
         }
     
-    def get_snapshot_data(self, snapshot_id: str) -> tuple[Optional[Dict], bool]:
+    def get_snapshot_data(self, snapshot_id: str) -> tuple[Optional[Dict], bool, bool, str]:
         """
         Retrieve data for a specific snapshot ID
         
@@ -53,7 +53,7 @@ class BrightdataClient:
             snapshot_id: The snapshot ID to retrieve
             
         Returns:
-            Tuple of (JSON response data or None if failed, is_still_running boolean)
+            Tuple of (JSON response data or None if failed, is_still_running boolean, is_valid boolean, error_reason string)
         """
         import json
         
@@ -71,24 +71,39 @@ class BrightdataClient:
             
             data = response.json()
             
-            # Check if data is still running
-            # Convert first part of data to string and check for 'running' keyword
-            data_str = json.dumps(data)[:500].lower()  # Check first 500 chars
-            is_running = 'running' in data_str
+            # Validate response
+            is_valid = True
+            error_reason = ""
             
-            if is_running:
-                logger.warning(f"Snapshot {snapshot_id} is still running")
-            else:
-                logger.info(f"Successfully retrieved data for snapshot: {snapshot_id}")
+            # Condition 1: Check if status is "running"
+            data_str = json.dumps(data)
+            if '"status":"running"' in data_str or '"status": "running"' in data_str:
+                is_valid = False
+                error_reason = "Status is running"
+                logger.warning(f"Snapshot {snapshot_id} has status 'running' - invalid response")
             
-            return data, is_running
+            # Condition 2: Check if response contains "error" key AND size < 2000 bytes
+            elif 'error' in data_str.lower():
+                response_size = len(data_str.encode('utf-8'))
+                if response_size < 2000:
+                    is_valid = False
+                    error_reason = f"Contains error and size < 2000 bytes (actual: {response_size})"
+                    logger.warning(f"Snapshot {snapshot_id} contains error with size {response_size} bytes - invalid response")
+            
+            # For backward compatibility: is_running = True if status is running
+            is_running = not is_valid and "running" in error_reason
+            
+            if is_valid:
+                logger.info(f"Successfully retrieved valid data for snapshot: {snapshot_id}")
+            
+            return data, is_running, is_valid, error_reason
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Error retrieving snapshot {snapshot_id}: {e}")
-            return None, False
+            return None, False, False, f"Request error: {str(e)}"
         except json.JSONDecodeError as e:
             logger.error(f"Error decoding response for snapshot {snapshot_id}: {e}")
-            return None, False
+            return None, False, False, f"JSON decode error: {str(e)}"
     
     def create_payload(self, keywords: List[str]) -> str:
         """
@@ -152,12 +167,13 @@ class SupabaseClient:
     def __init__(self, url: str, key: str):
         self.client: Client = create_client(url, key)
     
-    def save_snapshot(self, snapshot_id: str) -> bool:
+    def save_snapshot(self, snapshot_id: str, queries: List[str] = None) -> bool:
         """
-        Save snapshot ID to Supabase
+        Save snapshot ID with associated queries to Supabase
         
         Args:
             snapshot_id: The snapshot ID from Brightdata
+            queries: List of queries associated with this snapshot
             
         Returns:
             True if successful, False otherwise
@@ -165,30 +181,58 @@ class SupabaseClient:
         try:
             data = {
                 'snapshot_id': snapshot_id,
+                'query': queries if queries else [],
                 'processed': False
             }
             
             response = self.client.table('snapshot_table').insert(data).execute()
-            logger.info(f"Snapshot {snapshot_id} saved to Supabase")
+            logger.info(f"Snapshot {snapshot_id} saved to Supabase with {len(queries) if queries else 0} queries")
             return True
             
         except Exception as e:
             logger.error(f"Error saving snapshot to Supabase: {e}")
             return False
     
-    def get_unprocessed_snapshots(self) -> List[str]:
+    def get_all_existing_queries(self) -> List[str]:
         """
-        Get all snapshot IDs where processed = false
+        Get all unique queries from snapshot_table (flattened and lowercase)
         
         Returns:
-            List of unprocessed snapshot IDs
+            List of lowercase queries for case-insensitive comparison
         """
         try:
-            response = self.client.table('snapshot_table').select('snapshot_id').eq('processed', False).execute()
+            response = self.client.table('snapshot_table').select('query').execute()
             
-            snapshot_ids = [row['snapshot_id'] for row in response.data]
-            logger.info(f"Found {len(snapshot_ids)} unprocessed snapshots")
-            return snapshot_ids
+            all_queries = []
+            if response.data:
+                for row in response.data:
+                    queries = row.get('query', [])
+                    if queries:
+                        # Flatten and convert to lowercase
+                        all_queries.extend([q.lower().strip() for q in queries if q])
+            
+            # Return unique queries
+            unique_queries = list(set(all_queries))
+            logger.info(f"Found {len(unique_queries)} unique queries in database")
+            return unique_queries
+            
+        except Exception as e:
+            logger.error(f"Error fetching existing queries: {e}")
+            return []
+    
+    def get_unprocessed_snapshots(self) -> List[Dict]:
+        """
+        Get all snapshot IDs with their queries where processed = false
+        
+        Returns:
+            List of dictionaries with snapshot_id and query arrays
+        """
+        try:
+            response = self.client.table('snapshot_table').select('snapshot_id, query').eq('processed', False).execute()
+            
+            snapshots = response.data if response.data else []
+            logger.info(f"Found {len(snapshots)} unprocessed snapshots")
+            return snapshots
             
         except Exception as e:
             logger.error(f"Error fetching unprocessed snapshots: {e}")
@@ -377,7 +421,7 @@ class EmailScraperEngine:
         self.brightdata = brightdata_client
         self.supabase = supabase_client
     
-    def process_queries(self, queries: List[str], batch_size: int = 2) -> Dict[str, int]:
+    def process_queries(self, queries: List[str], batch_size: int = 2) -> Dict[str, any]:
         """
         Process search queries in batches and save snapshots to Supabase
         
@@ -393,6 +437,7 @@ class EmailScraperEngine:
         failed_batches = 0
         batch_count = 0
         submitted_ids = []
+        snapshot_query_map = {}  # Maps snapshot_id to queries
         
         logger.info(f"Starting to process {total_queries} queries with batch size {batch_size}")
         
@@ -400,9 +445,9 @@ class EmailScraperEngine:
         for i in range(0, total_queries, batch_size):
             batch_count += 1
             batch = queries[i:i + batch_size]
-            batch_size = len(batch)
+            current_batch_size = len(batch)
             
-            logger.info(f"Processing batch {batch_count} ({batch_size} queries)")
+            logger.info(f"Processing batch {batch_count} ({current_batch_size} queries): {batch}")
             
             # Send request to Brightdata
             response = self.brightdata.send_request(batch)
@@ -410,10 +455,11 @@ class EmailScraperEngine:
             if response and 'snapshot_id' in response:
                 snapshot_id = response['snapshot_id']
                 
-                # Save to Supabase
-                if self.supabase.save_snapshot(snapshot_id):
+                # Save to Supabase with query array
+                if self.supabase.save_snapshot(snapshot_id, batch):
                     successful_snapshots += 1
                     submitted_ids.append(snapshot_id)
+                    snapshot_query_map[snapshot_id] = batch
                 else:
                     failed_batches += 1
             else:
@@ -421,7 +467,7 @@ class EmailScraperEngine:
                 failed_batches += 1
             
             # Add delay between requests to avoid rate limiting
-            if i + batch_size < total_queries:
+            if i + current_batch_size < total_queries:
                 time.sleep(2)
         
         statistics = {
@@ -429,7 +475,8 @@ class EmailScraperEngine:
             'successful_snapshots': successful_snapshots,
             'failed_batches': failed_batches,
             'total_batches': batch_count,
-            'submitted_ids': submitted_ids
+            'submitted_ids': submitted_ids,
+            'snapshot_query_map': snapshot_query_map
         }
         
         return statistics
